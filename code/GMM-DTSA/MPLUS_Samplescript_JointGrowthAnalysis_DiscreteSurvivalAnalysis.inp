@@ -1,0 +1,34 @@
+TITLE:     Joint growth and discrete-time survival analysis
+
+DATA:      FILE IS SampleInput.csv;
+
+VARIABLE:  NAMES ARE id y1-y13 u1-u12;
+idvariable = id;
+usevar = y1-y13  u2-u12;
+CLASSES = c(2);
+CATEGORICAL = u2-u12;
+MISSING = ALL(-9999);
+           
+ANALYSIS: estimator = MLR;   
+TYPE = MIXTURE;
+processors = 16;
+Starts =2000 100;
+MODEL:    
+           %OVERALL%
+
+i s q | y1@0  y2@3 y3@6 y4@9
+      y5@12 y6@15 y7@18 y8@21
+      y9@24 y10@27 y11@30 y12@33
+      y13@36;
+
+           f BY u2-u12@1;
+            %c#1%
+            [ i-q];
+           i@0 s@0 q@0;
+          %c#2%
+          [i-q];
+           i@0 s@0 q@0;
+
+OUTPUT: TECH1 TECH8 TECH11 TECH14
+CINTERVAL!
+OUTPUT:    TECH1 TECH8 TECH11 TECH14;
