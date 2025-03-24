@@ -25,8 +25,7 @@ if __name__ == '__main__':
 
     if paralell:
         # compute all data
-        with Pool(6) as p:     
-            # input_data = list(product(datasets, methods))
+        with Pool(6) as p:
             results = p.starmap(hyperopt_all_methods, input_data)
     else:
         results = []
@@ -37,11 +36,11 @@ if __name__ == '__main__':
     # export all
     results = pd.concat(results,axis=0)
     results['is_best_trial'] = results['best_trial']==results['trial']
-    results.to_csv('data/results_strat_xgbmaepo_weighted_all34.csv',index=False)
+    results.to_csv('data/results_strat_xgbmaepo_weighted_all6_no_imputation.csv',index=False)
     # results.to_csv('data/results_all_SurvFinal.csv',index=False)
     
     # get a summary
     # results = pd.read_csv('data/results_all_SurvFinal.csv')
-    best_results = results.query('is_best_trial==True').sort_values(by=['Cindex_test_uncensored'],ascending=False).drop_duplicates(subset=['method','dataset'],keep='first')
+    best_results = results.query('is_best_trial== True').sort_values(by=['Cindex_test_uncensored'],ascending=False).drop_duplicates(subset=['method','dataset'],keep='first')
     # best_results.to_csv('data/results_best_SurvFinal.csv',index=False)
-    best_results.to_csv('data/results_best_strat_xgbmaepo_weighted_all34.csv',index=False)
+    best_results.to_csv('data/results_best_strat_xgbmaepo_weighted_all6_no_imputation.csv',index=False)

@@ -3,9 +3,11 @@
 # last reviewed: Jan 2025
 # These are general utilities
 
-
+import pickle 
 import os
 import pandas as pd
+import copy
+from utils.constants import *
 from sklearn.svm import SVR
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
@@ -21,10 +23,15 @@ from frechetdist import frdist
 from lifelines.utils import concordance_index
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.metrics import accuracy_score,roc_curve, roc_auc_score
 
-var_dict = {'Q3_Cl': 'q3', 'Bulb_Cl': 'bulbar_subscore', 'TALS_Cl': 'ALSFRS_Total', 'Resp_Cl': '% predicted'}
-classnums = {'q3': 3, 'bulbar_subscore': 4, 'ALSFRS_Total': 4, '% predicted': 3}
-var_dict_inv = {v:k for k,v in var_dict.items()}
+def exp_decay_fcn(x, slope, maxval=48):
+    return maxval * np.exp (- x / slope )
+
+def lin_fcn (x, slope, maxval):
+    return maxval - x * slope
 
 def median_absolute_error(y_test,y_pred):
     return np.median(np.abs(y_test-y_pred))
@@ -150,7 +157,7 @@ def get_initial_features(df_master,df_phenotype_mapper):
     dftd = df_master.loc[:,cols]
 
     # get the time-independent variables:
-    cols = ['Database', 'id', 'sex', 'age_at_onset', 'site_onset',
+    cols = ['Database', 'id', 'sex', 'age_at_onset', 'site_onset','el_escorial',
         'diagnostic_delay_months', 'ALSFRS_Slope_Onset_to_FirstALSFRS',
         'ALSFRS_bulbar_Slope_Onset_to_FirstALSFRS','C9orf72','SOD1', 'FUS','TARDBP']
     dfti = df_master.loc[:,cols]
@@ -175,6 +182,7 @@ def get_initial_features(df_master,df_phenotype_mapper):
     # remap phenotypes
     dict_phenotype_mapper = {row['Phenotype original']:row['Phenotype new'] for ri,row in df_phenotype_mapper.iterrows()}
     df_features['Phenotype'] = df_features['Phenotype'].map(dict_phenotype_mapper)
+    df_features['el_escorial'] = df_features['el_escorial'].isin(['Definite','Clinically Definite']).astype(int)
     
     # get the ones with censoring information:
     df_features = df_features.merge(dfcens.loc[:,'id'],on='id',how='inner')
@@ -209,11 +217,10 @@ def get_initial_features(df_master,df_phenotype_mapper):
 
     return df_features,dfcens
 
-
 def load_death_features(path_master,path_encals_pred):
     # load feature data
     df_master = pd.read_csv(path_master,encoding='latin_1',low_memory=False)
-    dffeat = pd.read_csv("/Users/juandelgado/Desktop/Juan/code/imperial/imperial-als/best_models/data/encals_features.csv")
+    dffeat = pd.read_csv("/Users/juandelgado/Desktop/Juan/code/imperial/imperial-als/time_prediction/data/encals_features.csv")
 
     dfpred = pd.read_csv(path_encals_pred)
     dfpred.index = dfpred['Unnamed: 0']-1
@@ -286,13 +293,21 @@ def verticalise(daux):
         print(c,aux.keys())
     return pd.concat(D,axis=0,ignore_index=True)
 
+def verticalise_classes(df_classes):
+    df_class_feats2 = df_classes.melt(id_vars=['id']).query('value != 0').reset_index(drop=True)
+    df_class_feats2['class'] = df_class_feats2['variable'].apply(lambda x:x.split('_')[-1])
+    df_class_feats2['variable'] = df_class_feats2['variable'].apply(lambda x:'_'.join(x.split('_')[:-1]))
+    return df_class_feats2
+
 def convert_to_class_means(df_classes,df_features):
-    df_features_v = verticalise(df_features.drop(columns=['Phenotype']+list(df_features.iloc[:,-13:].columns)))
+    df_features_v = verticalise(df_features.drop(columns=['Phenotype']+list(df_features.iloc[:,-14:].columns)))
     df_features_v['days'] = df_features_v['days'].astype(int)
+    df_classes = verticalise_classes(df_classes)
     A = []
     for var in df_classes['variable'].unique():#.iloc[:,1:].columns:
         for li,l in list(df_classes.query(f'variable == "{var}"').groupby('class')):#list(df_classes.loc[:,['id',var]].groupby(var)):
-            daux = df_features_v.query(f"id in {tuple(l['id'].values)} and variable == '{var}'")
+            var2 = 'Weight' if var == 'weight' else var
+            daux = df_features_v.query(f"id in {tuple(l['id'].values)} and variable == '{var2}'")
             g = daux.groupby('days')['value']
             A.append(pd.concat([g.mean().rename(f'{var}_{li}'),
                         (g.mean()+1.96*g.std()/np.sqrt(g.count())).rename(f'{var}_{li}_ul'),
@@ -307,7 +322,9 @@ def get_trendlines(df_classes_means,reload = False):
         dpopt = []
         cols = [k for k in df_classes_means.keys() if (not k.endswith('_ul') and not k.endswith('_ll')) and k != 'days']
         for var in cols:
+            varname = '_'.join(var.split("_")[:-1])
             dfnow = df_classes_means.loc[:,['days',var]].dropna()
+            dfnow = pd.concat([pd.DataFrame([0,maxvals[varname]],index=dfnow.keys(),columns=[0]).T, dfnow]).reset_index(drop=True)
             print(var)
             popt, pcov = curve_fit(exp_decay, dfnow['days'].astype(float), dfnow.loc[:,var],p0=[1,0.01])
             dpopt.append(pd.DataFrame(["_".join(var.split("_")[:-1]),var.split("_")[-1]]+popt.tolist()+[pcov[0,0]**.5,pcov[1,1]**.5],index=['variable','class','a','b','a_stdE','b_stdE']).T)
@@ -389,7 +406,6 @@ def run_train_eval_pipe(X,y,dfstrat,results,res_df,model,name='RF',feature_names
     print(f"{feature_names} {name} test",cal_metrics(y_test,y_pred,90))
     return results,res_df
 
-
 def compute_frechet_distance(dfpoint,var="ALSFRS"):    
     P = dfpoint.loc[:,["days",var]].astype(int).values.tolist()
     Q = [dfpoint.loc[:,["days",f"{var}_inferred_{ni}"]].astype(int).values.tolist() for ni in range(1,classnums[var]+1)]
@@ -427,7 +443,7 @@ def map_classes(distances):
         id2 = pd.DataFrame(np.where(id)).T.sample(frac=1).drop_duplicates(subset=0,keep='first').sort_values(0)[1]
         l['class'] = id2.values+1
         out.append(l.loc[:,['var','id','class']])
-    return pd.concat(out)
+    return pd.concat(out,axis=0)
 
 def get_class_features_frechet(df_classes,df_features,suffix = "",reload_class_features=False):
     if reload_class_features:
@@ -438,7 +454,7 @@ def get_class_features_frechet(df_classes,df_features,suffix = "",reload_class_f
         dpopt = get_trendlines(df_classes_means,reload=True)
 
         # reformat features
-        df_features_v = verticalise(df_features.drop(columns=['Phenotype']+list(df_features.iloc[:,-13:].columns)))
+        df_features_v = verticalise(df_features.drop(columns=['Phenotype']+list(df_features.iloc[:,-14:].columns)))
 
         # get the fretchet distances
         distances = compute_all_distances(df_features_v,dpopt)
@@ -446,8 +462,8 @@ def get_class_features_frechet(df_classes,df_features,suffix = "",reload_class_f
         # map classes
         df_class_pred = map_classes(distances)
         df_class_feats = pd.get_dummies(df_class_pred.pivot(index='id',columns='var',values='class').fillna(0).astype(int),columns=['ALSFRS_Total',  'bulbar_subscore',  'q3',  '% predicted']).astype(int).reset_index()
-        cols_to_drop = [c for c in df_classes.keys() if c.endswith('0')]
-        df_classes.drop(columns=cols_to_drop,inplace=True)
+        cols_to_drop = [c for c in df_class_feats.keys() if c.endswith('0')]
+        df_class_feats.drop(columns=cols_to_drop,inplace=True)
         df_class_feats.to_csv(f'data/class_features{suffix}.csv',index=False)
         return df_class_feats
     else:
@@ -463,15 +479,95 @@ def load_classes():
         aux = aux.rename(columns={'numID':'id','cl'+str(classnums[variable_name]):'class'})
         cols = ['id','variable','class']
         df_classes.append(aux.loc[:,cols])
-    return pd.concat(df_classes)
+    df_classes = pd.concat(df_classes)
+    # add the weight classes
+    dfw = pd.read_csv('/Users/juandelgado/Desktop/Juan/code/imperial/imperial-als/Paper/Fig_2/data_for_figures/weight_delay_dataset_cens.csv').query('threshold == 0.05')
+    dfw = dfw.loc[:,['numid','threshold_reached']].rename(columns={'numid':'id','threshold_reached':'class'})
+    dfw['variable'] = 'weight'
+    return pd.concat([df_classes,dfw],axis=0,ignore_index=True)
     
 def get_class_features_gt():
-
-    df_classes = load_classes()
-    df_classes = pd.pivot_table(df_classes,index='id',columns=['variable'],values='class').fillna(0).astype(int).astype(str)
-    df_classes = pd.get_dummies(df_classes).reset_index().astype(int)
-    cols_to_drop = [c for c in df_classes.keys() if c.endswith('0')]
+    df_classes00 = load_classes()
+    df_classes0 = reformat_classes(df_classes00)
+    df_classes = pd.get_dummies(df_classes0).reset_index().astype(int)
+    cols_to_drop = [c for c in df_classes.keys() if c.endswith('0') and not c.startswith('weight')]
     df_classes.drop(columns=cols_to_drop,inplace=True)
+    return df_classes
+
+def reformat_classes(df_classes00):
+    return pd.pivot_table(df_classes00,index='id',columns=['variable'],values='class').fillna(0).astype(int).astype(str)
+
+def fetch_slope_points(var,myclass,timedomain):
+        dfauxx = pd.DataFrame([timedomain],index=['time']).T
+        slope = funpar[var][myclass][0]
+        maxval = maxvals[var]
+        dfauxx["inferred_mean"] = dfauxx["time"].apply(lambda x:globals()[fcn_var[var]](x, slope, maxval=maxval))
+        dfauxx["inferred_overall_mean"] = dfauxx["inferred_mean"].mean()
+        return dfauxx
+
+def recover_std(dfnow,myclass,time):
+    aa = dfnow.query(f'`class` == {myclass} and time == {time}')
+    # if the value does not exist, take the closest one
+    if aa.empty: 
+        aa = dfnow.query(f'`class` == {myclass}')
+        aa['t_diff'] = np.abs(aa['time']-time)
+        aa = aa.sort_values(by='t_diff').iloc[0,:]
+    return aa['mean']-aa['lowCI']
+
+def add_ordinal(df_classes0,ignore_weight=False):
+    df_class_feats2 = verticalise_classes(df_classes0).copy()
+    # print("shape1",df_class_feats2.shape)
+    df_classes1 = df_class_feats2.pivot(index='id',columns=['variable'],values='class')
+    df_classes1 = df_classes1.rename(columns={c:c+"_ord_cl_eq" for c in df_classes1.keys() if c != 'id'}).reset_index()
+    df_classes = df_classes0.merge(df_classes1,on='id',how='outer')
+    # print("shape2",df_class_feats2.shape)
+    # add ordinal classes - maximal
+    class_dict = {'q3': 'q3', 'Bulb': 'bulbar_subscore', 'Resp': '% predicted', 'TALS': 'ALSFRS_Total', 'Weight': 'weight'}
+    # df_classes = df_classes.merge(df_classes0,on='id',how='outer')
+    dff = pd.read_csv('/Users/juandelgado/Desktop/Juan/code/imperial/imperial-als/time_prediction/data/class_traj_summary.csv')
+    AA = {}
+    for var,l in list(dff.groupby(['variable'])):
+        if ignore_weight and var[0]=='Weight':
+            continue
+        dfnow = l.query('time == 540')
+        A = {str(row['class']):row['mean']/l['mean'].max() for ri,row in dfnow.iterrows()}
+        dfclassnow = copy.deepcopy(df_class_feats2.query(f'variable == "{class_dict[var[0]]}"'))
+        dfclassnow.loc[:,class_dict[var[0]]+'_ord_cl_neq'] = dfclassnow.loc[:,'class'].map(A)
+        df_classes = df_classes.merge(dfclassnow.loc[:,['id',class_dict[var[0]]+'_ord_cl_neq']],on='id',how='outer')
+        # print("shape3",l[0][0],df_class_feats2.shape)
+
+        # the longitudinal slope
+        timedomain= tuple(np.arange(90,1170,90))
+        dfnow = l.query(f'time in {timedomain}')
+        A = {str(lo.iloc[0,5]):[(maxvals[class_dict[row['variable']]]-row['mean'])/row['time']*365.25/12 for ri,row in lo.iterrows()] for li, lo in list(dfnow.groupby('class'))}
+        dfclassnow = copy.deepcopy(df_class_feats2.query(f'variable == "{class_dict[var[0]]}"'))
+        dfclassnow.loc[:,class_dict[var[0]]+'_ord_cl_slope'] = dfclassnow.loc[:,'class'].map(A)
+        columns = [class_dict[var[0]]+'_ord_cl_slope_' + str(t) for t in timedomain]
+        dfclassnow.dropna(subset=[class_dict[var[0]]+'_ord_cl_slope'],inplace=True)
+        dfclassnow[columns] = pd.DataFrame(dfclassnow.loc[:,class_dict[var[0]]+'_ord_cl_slope'].tolist(), 
+                                                                                                       index= dfclassnow.index)
+        df_classes = df_classes.merge(dfclassnow.loc[:,['id']+columns],on='id',how='outer')
+        
+        # neqm - longitudinal value
+        timedomain= tuple(np.arange(0,1170,90))
+        dfnow = l.query(f'time in {timedomain}')
+        # this was a test to jitter the results but it is not resolving anything
+        A = {str(myclass):[float(np.random.normal(row['inferred_mean'], recover_std(dfnow,myclass,row["time"])))/dfnow['mean'].mean() for ri,row in fetch_slope_points(class_dict[var[0]],myclass,timedomain).iterrows()] for myclass in l['class'].unique()}
+        # A = {str(myclass):[row['inferred_mean']/dfnow['mean'].mean() for ri,row in fetch_slope_points(class_dict[var[0]],myclass,timedomain).iterrows()] for myclass in l['class'].unique()}
+        dfclassnow = copy.deepcopy(df_class_feats2.query(f'variable == "{class_dict[var[0]]}"'))
+        dfclassnow.loc[:,class_dict[var[0]]+'_ord_cl_neqm'] = dfclassnow.loc[:,'class'].map(A)
+        columns = [class_dict[var[0]]+'_ord_cl_neqm_' + str(t) for t in timedomain]
+        dfclassnow.dropna(subset=[class_dict[var[0]]+'_ord_cl_neqm'],inplace=True)
+        dfclassnow[columns] = pd.DataFrame(dfclassnow.loc[:,class_dict[var[0]]+'_ord_cl_neqm'].tolist(), 
+                                                                                                       index= dfclassnow.index)
+        df_classes = df_classes.merge(dfclassnow.loc[:,['id']+columns],on='id',how='outer')
+        AA.update({var:A})
+
+    with open('data/neqm_values.pkl', 'wb') as f:
+        pickle.dump(AA, f)
+        
+    # A = {1:l[1]['mean'].max()-dfnow['mean'].max()}
+    # A.update({M:(dfnow.query(f'`class` == {M}')['mean'].values-dfnow.query(f'`class` == {M-1}')['mean'].values)[0] for M in range(2,dfnow['class'].max()+1)})
     return df_classes
 
 def plot_model_results(results,model_subset):
@@ -486,7 +582,6 @@ def plot_model_results(results,model_subset):
 
     (base.mark_bar()+base.mark_text(align='left', dx=2)).properties(width=100,height=100).facet(column='variable:N',row='data').resolve_scale(x='independent').save('data/results_metrics.html')
 
-
 def features_km(df_master):
     cols_km = ['Database',     'id' ,  'tcens' , 'cens' ,  'Phenotype', 'site_onset', 'sex' , 'age_at_onset','Baseline_Weight','Dead','Death_Date', 'last_follow_up',  'Outcome_Date','Onset_Date']
     aux = df_master.loc[:,cols_km].copy()
@@ -495,3 +590,83 @@ def features_km(df_master):
     aux['tcens_corr'] = (aux['Outcome_Date'] - aux['Onset_Date']).fillna(aux['last_follow_up'] - aux['Onset_Date'])
     aux['cens_corr'] = aux['Outcome_Date'].isna().astype(int)
     aux.to_csv('data/km.csv',index=False)
+
+def fit_logistic_reg_death_gastro(df_combo):
+    dfnew = df_combo.query('lbl in ("Gastrostomy","Death")').loc[:,['lbl','gastrostomy_pred','death_pred']]
+    
+    dfnew = dfnew.dropna()
+    X, y = dfnew.loc[:,['gastrostomy_pred','death_pred']].values, (dfnew['lbl']=='Gastrostomy').astype(int).values
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=1)
+    clf = LogisticRegression(random_state=1)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Accuracy: {accuracy:.4f}")
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=1) 
+    cv_scores = cross_val_score(clf, X, y, cv=kf, scoring='accuracy')
+    print(f"Cross-Validation Accuracy (5-fold): {cv_scores}")
+    print(f"Mean CV Accuracy: {np.mean(cv_scores):.4f}")
+    print(f"Standard Deviation CV Accuracy: {np.std(cv_scores):.4f}")
+
+    y_prob = clf.predict_proba(X_test)[:, 1]  # Probabilities of the positive class
+
+    # Calculate ROC curve
+    fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+
+    # Calculate AUC (Area Under the ROC Curve)
+    roc_auc = roc_auc_score(y_test, y_prob)
+    print("ROC AUC:",roc_auc)
+    
+    return clf,fpr,tpr
+
+def fit_rbf_svm_death_gastro(df_combo):
+    from sklearn import svm
+    dfnew = df_combo.query('lbl in ("Gastrostomy","Death")').loc[:,['lbl','gastrostomy_pred','death_pred']]
+    
+    dfnew = dfnew.dropna()
+    X, y = dfnew.loc[:,['gastrostomy_pred','death_pred']].values, (dfnew['lbl']=='Gastrostomy').astype(int).values
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=1)
+    C = 1  # SVM regularization parameter
+    clf = svm.SVC(kernel = 'rbf',  gamma='auto', degree=2, C=C , probability=True)
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"Accuracy: {accuracy:.4f}")
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=1) 
+    cv_scores = cross_val_score(clf, X, y, cv=kf, scoring='accuracy')
+    print(f"Cross-Validation Accuracy (5-fold): {cv_scores}")
+    print(f"Mean CV Accuracy: {np.mean(cv_scores):.4f}")
+    print(f"Standard Deviation CV Accuracy: {np.std(cv_scores):.4f}")
+
+    y_prob = clf.predict_proba(X_test)[:, 1]  # Probabilities of the positive class
+
+    # Calculate ROC curve
+    fpr, tpr, thresholds = roc_curve(y_test, y_prob)
+
+    # Calculate AUC (Area Under the ROC Curve)
+    roc_auc = roc_auc_score(y_test, y_prob)
+    print("ROC AUC:",roc_auc)
+    
+    return clf,fpr,tpr
+
+def compute_roc_auc_threshold(df_combo):
+    df_combo = df_combo.query('lbl in ("Gastrostomy","Death")').reset_index(drop=True)
+    y_test = (df_combo['lbl']=='Gastrostomy').astype(int)
+    y_proba = (df_combo['gastrostomy_pred']-df_combo['death_pred'] <=0).astype(float)
+    fpr, tpr, thresholds = roc_curve(y_test, y_proba)
+    roc_auc = roc_auc_score(y_test, y_proba)
+    print('threshold ROC AUC:',roc_auc)
+    return fpr, tpr, roc_auc
+
+def compute_roc_auc_weight(df_combo):
+    df_combo = df_combo.query('lbl in ("Gastrostomy","Death")').dropna(subset='weight').reset_index(drop=True)
+    y_test = (df_combo['lbl']=='Gastrostomy').astype(int)
+    y_proba = (df_combo['weight']>1).astype(float)
+    fpr, tpr, thresholds = roc_curve(y_test, y_proba)
+    roc_auc = roc_auc_score(y_test, y_proba)
+    print('weight ROC AUC:',roc_auc)
+    return fpr, tpr, roc_auc
+
+

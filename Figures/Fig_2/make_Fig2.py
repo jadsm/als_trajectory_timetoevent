@@ -24,12 +24,12 @@ def load_csvs(root,file):
     return df
 
 # load the data
-path_figs = 'data for figures'
+path_figs = 'data_for_figures'
 df = pd.concat([load_csvs(root,file) for root, folder, files in os.walk(path_figs) for file in files if not file.startswith('weight')],
                        axis=0,ignore_index=True)
 # load and condition weight dataframe
 
-dfw = pd.read_csv('data for figures/weight_delay_dataset_cens.csv').rename(columns={'threshold_reached':'class'}).query('threshold==0.05')
+dfw = pd.read_csv(f'{path_figs}/weight_delay_dataset_cens.csv').rename(columns={'threshold_reached':'class'}).query('threshold==0.05')
 dfw['events'] = (dfw['cens'] == 0).astype(int)
 results = get_km_values(dfw['tcens'], dfw['events'], dfw['class'])
 res0 = results[0]
@@ -45,7 +45,7 @@ res['variable'] = 'Weight'
 res = res.loc[:,df.keys()]
 res['class'] = res['class'].map({1:3,2:1})
 
-dfw2 = pd.read_csv('data for figures/weight_decay_dataset_cens.csv').rename(columns={'days_from_onset':'time','cl2':'class'})
+dfw2 = pd.read_csv(f'{path_figs}/weight_decay_dataset_cens.csv').rename(columns={'days_from_onset':'time','cl2':'class'})
 dfw2['type'] = 'traj'
 dfw2['variable'] = 'Weight'
 dfw2 = dfw2.loc[:,df.keys()].dropna()
@@ -66,12 +66,12 @@ dfw2.loc[:,'mean':'highCI'] = dfw2.loc[:,'mean':'highCI']*100
 # dfwo = dfwo.loc[:,df.keys()]
 # # concatenate both dataframes
 df = pd.concat([df,dfw2,res],axis=0,ignore_index=True).query('time<=1080')
-
+df.query('type == "traj"').to_csv('/Users/juandelgado/Desktop/Juan/code/imperial/imperial-als/time_prediction/data/class_traj_summary.csv',index=False)
 # df.to_csv(os.path.join(path_figs,'traj_surv_merged.csv'),index=False)
 df.loc[:,'order'] = df['type'].map({'traj':0,'surv':1})
 idx = df['type'] == 'surv'
 df.loc[idx,colnames[:3]] = 1 - df.loc[idx,colnames[:3]]
-var_map = {'TALS':'Total ALSFRS', 'Bulb':"Bulbar Score", 'q3':"Swallowing function (Q3)", 'Resp':'Respiratory function (FVC)', 'Weight':'Weight'}
+var_map = {'TALS':'ALSFRS-R total', 'Bulb':"Bulbar score", 'q3':"Swallowing function (Q3)", 'Resp':'Respiratory function (VC)', 'Weight':'Weight loss (%)'}
 df['variable'] = df['variable'].map(var_map)
 df.loc[idx,'type'] = 'Prob. Gastrostomy'
 df.loc[~idx,'type'] = df.loc[~idx,'variable']
@@ -96,13 +96,20 @@ df['class'] = df['class'].map(class_map)
 colours = {'very slow':'#0072B2','slow': '#94CBEC', 'medium': '#DCCD7D', 'fast':'#C26A77'}#, 5:'#000074'
 
 # plot the data
-base = alt.Chart(df).encode(x='time:Q',color = alt.Color('class:N').scale(domain=list(colours.keys()),
+base = alt.Chart(df).encode(x=alt.X('time:Q',axis=alt.Axis(values=[0,365,730,1080])).title('days'),color = alt.Color('class:N').scale(domain=list(colours.keys()),
                                                                           range=list(colours.values())))
 line = base.mark_line().encode(y='mean',
                                tooltip=['mean', 'lowCI', 'highCI', 'time','class'])
 errorband = base.mark_errorband().encode(y=alt.Y('lowCI',axis=alt.Axis(tickCount=3)).title(None),
                                          y2 = 'highCI')
-chart = (line+errorband).facet(column=alt.Column('type', header=alt.Header(labelFontSize=16)).title(None).sort(alt.SortField(field='order', order='ascending'))).resolve_scale(y='independent')
+chart = (line+errorband).facet(column=alt.Column('type', header=alt.Header(labelFontSize=20)).title(None).sort(alt.SortField(field='order', order='ascending'))).resolve_scale(y='independent')
 C = [chart.transform_filter(alt.FieldEqualPredicate(field='variable',equal=var)) for var in df['variable'].unique()]
-((C[0]|C[1]|C[4])&(C[2]|C[3])).configure_axis(labelFontSize=16, titleFontSize=16 
-).configure_legend(labelFontSize=16,titleFontSize=16,orient='bottom').save('Fig2alt4.html')
+((C[0]|C[1])&(C[2]|C[3])).configure_axis(labelFontSize=20, titleFontSize=20 
+).configure_legend(title=None,labelFontSize=20,orient='right',direction='vertical').save('Fig2alt5.html')
+
+C[4].configure_axis(labelFontSize=20, titleFontSize=20 
+).configure_legend(title=None,labelFontSize=20,orient='right',direction='vertical').save('Fig2weight.html')
+
+# plot the probability only
+chart2 = (line.encode(color='variable')+errorband.encode(color='variable')).transform_filter(alt.FieldEqualPredicate(field='type',equal='Prob. Gastrostomy')).transform_filter(alt.FieldEqualPredicate(field='class',equal='fast'))
+chart2.properties(title='Prob. Gastrostomy for fastest functional decline').save('Prob_fast.html')

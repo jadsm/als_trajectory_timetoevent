@@ -32,17 +32,22 @@ from utils.constants import *
 
 
 # datasets = ['encals','classes', 'decayfeatures','classes+decay']# ,'rawfeatures'
-datasets = ['classes+decay','classes']
-# datasets = ['rawfeatures']
-methods = ['SkSurvCoxLinear']
+datasets = ['demo','classes_neqm']
+# datasets = ['demo','classes','classes_eq','classes_neq','classes_slope','classes_neqm']
+# datasets = ['classes','classes_eq','classes_neq']
+methods = ['SkSurvCoxLinear','XGBoostCox','XGBoostMAEPOReg']
 # methods = ['XGBoostCox','SkSurvCoxLinear','XGBoostMAEPOReg']#,'SVRAFT' 'SkSurvCoxLinear','SVRAFT','RFAFT', '
 
+mice_imputation = False
+test_only = False
 seed,n_trials = 1,5
 bootstrap_flag = True
 paralell = True
 ignore_computed_methods = True
 f_threshold = .5
 hazard_ratio_scale = .9    
+n_iterations = 100
+bootstrap_frac = .8
 
 def remove_nans(X00,y00,strat_var0,col_threshold = 4000):
     cols_to_keep = np.isnan(X00.astype(float)).sum(axis=0)<col_threshold
@@ -53,7 +58,7 @@ def remove_nans(X00,y00,strat_var0,col_threshold = 4000):
     y = Surv.from_arrays(event=event, time=time)   
     y = y[idx_to_keep]
     strat_var = strat_var0[idx_to_keep]
-    return X,y,strat_var
+    return X,y,strat_var,cols_to_keep
 
 def get_df_pred(y_train,y_test,y_pred_train,y_pred_test,train_idx,test_idx,database_rotation,method,dataset):
     idx_unc_train = np.where([ii[0]==1 for ii in y_train])[0]
@@ -204,6 +209,40 @@ def calculate_perc_survival_time(model_obj,X,y,f=.5):
             aa.append(idx.index[0])
     return np.array(aa)
 
+def calc_bootstrap(model_obj,dfsummary,X_test,y_test,dtrain_valid_combined,train_uncensored,test_uncensored,study=None,test_fold_id=None):
+    test_uncensored0 = test_uncensored.copy()
+    start = time.time()
+    n_size = int(len(X_test) * bootstrap_frac)
+    A = []
+    suffix = '_test_uncensored'
+    for i in range(n_iterations):
+        x = np.arange(X_test.shape[0])
+        np.random.shuffle(x)
+        # test_uncensored = np.ones(n_size).astype(bool)
+        test_uncensored = test_uncensored0[x[:n_size]]
+        dtest = model_obj.dmat_builder(X_test[x[:n_size],:], y_test[x[:n_size]])
+        
+        # y_pred_now,y_pred_train_now = model_obj.compute_test_pred(None, dtrain_valid_combined, dtest,params_df=model_obj.params_df)
+
+        aux = calc_all_metrics(pd.DataFrame(),study,model_obj,test_fold_id,dtrain_valid_combined, dtest,[train_uncensored,test_uncensored])
+        # aux = calc_all_metrics(pd.DataFrame(),None,model_obj,None,X_test,y_test,y_pred_train_now,x[:n_size],x[:n_size])
+
+        A.append(aux.loc[:,['PredIn90'+suffix,'MedianAE'+suffix,'Cindex'+suffix]])
+    
+    A = pd.concat(A)
+    
+    for var,max in {'Cindex':1,'MedianAE':10000,'PredIn90':1}.items():
+        dfsummary[f'{var}_mean'] = A.loc[:,var+suffix].mean()
+        dfsummary[f'{var}_lb'] = np.clip(dfsummary[f'{var}_mean']-A.loc[:,var+suffix].std()*1.96,a_min=0,a_max=None)
+        dfsummary[f'{var}_ub'] = np.clip(dfsummary[f'{var}_mean']+A.loc[:,var+suffix].std()*1.96,a_min=None,a_max=max)
+    end = time.time()
+    time_taken = end - start
+    print(f'Time elapsed (boostrapping n={n_iterations}) = {time_taken}')
+    dfsummary['elapsed_time_bootstrap'] = time_taken
+    dfsummary['n_bootstraps'] = n_iterations
+    dfsummary['bootstrap_frac'] = bootstrap_frac
+    return dfsummary
+
 def load_data(suffix=''):
     y0 = pd.read_csv('data/cens.csv')
     y0 = y0.loc[y0['tcens']>=0,:]
@@ -217,11 +256,14 @@ def load_data(suffix=''):
     y00 = Surv.from_arrays(event=y0['event'].values, time=y0['tcens'].values)   
     tau = np.percentile(y0['tcens'].values[y0['event'].values], q=80)
     # stratification variable
-    strat_var0 = pd.concat([X0.loc[:,k].replace(True,k.split('_')[1]).replace(False,np.nan) for k in X0.keys() if k.startswith('Database')],axis=1)
-    strat_var0['Database'] = strat_var0.iloc[:,0] 
-    for k in strat_var0.keys()[1:]:
-        strat_var0['Database'] = strat_var0['Database'].fillna(strat_var0[k])
-    strat_var0 = strat_var0.drop(columns=strat_var0.keys()[:-1]).values
+    try:
+        strat_var0 = X0.loc[:,'Database']
+    except:
+        strat_var0 = pd.concat([X0.loc[:,k].replace(True,k.split('_')[1]).replace(False,np.nan) for k in X0.keys() if k.startswith('Database')],axis=1)
+        strat_var0['Database'] = strat_var0.iloc[:,0] 
+        for k in strat_var0.keys()[1:]:
+            strat_var0['Database'] = strat_var0['Database'].fillna(strat_var0[k])
+        strat_var0 = strat_var0.drop(columns=strat_var0.keys()[:-1]).values
 
     return X0, y00, tau, strat_var0, feature_key
 
@@ -712,7 +754,8 @@ class SkSurvCoxLinear:
         X_test, _ = dtest
         try: 
             self.modelnow.fit(X_train_valid, y_train_valid)
-        except:
+        except Exception as e:
+            print(e)
             # subsample the set - COX collinearity fails sometimes
             c = 0
             while c < 10: # try 10 times before failing 
@@ -755,7 +798,7 @@ def get_train_valid_test_splits(*, X_train_valid, y_train_valid, X_test, y_test,
 
     return train_valid_ls, dmat_train_valid_combined, dtest
 
-def run_nested_cv(*, X, y, tau, strat_var, seed, sampler, n_trials, model_obj):
+def run_nested_cv(*, X, y, tau, strat_var, seed, sampler, n_trials, model_obj,dataset=''):
 
     if model_obj.prediction_type == 'survival':
         def valid_metric_func(y_valid, y_pred):
@@ -809,6 +852,13 @@ def run_nested_cv(*, X, y, tau, strat_var, seed, sampler, n_trials, model_obj):
         test_uncensored = np.array([yy[0] for yy in y[test_idx]])
 
         out = calc_all_metrics(out,study,model_obj,test_fold_id,dtrain_valid_combined, dtest,[train_uncensored,test_uncensored])
+        
+        if bootstrap_flag:
+            out = calc_bootstrap(model_obj,out,X[test_idx, :],y[test_idx],dtrain_valid_combined,train_uncensored,test_uncensored,study,test_fold_id)
+
+        # save the best model of this fold
+        with open(f'models/gastro_{model_obj.method_name}_{dataset}_{test_fold_id}.pkl', 'wb') as fid:
+            pickle.dump(model_obj, fid)
 
     end = time.time()
     time_taken = end - start
@@ -816,26 +866,56 @@ def run_nested_cv(*, X, y, tau, strat_var, seed, sampler, n_trials, model_obj):
     out['elapsed_time'] = time_taken
     return out
 
+def split_data_add_mice(X,y,strat_var,database_rotation):
+    test_idx = (strat_var == database_rotation).reshape(-1,)
+    # X_train, X_test, y_train, y_test = train_test_split(X, y,
+    #                                                 stratify=strat_var, 
+    #                                                 test_size=0.3,random_state=seed)
+    X_train, X_test, y_train, y_test = X[~test_idx,:],X[test_idx,:],y[~test_idx],y[test_idx]
+    
+    if mice_imputation:
+        # MICE imputation - Multiple Imputation by Chain Equations
+        imp_mean = IterativeImputer(random_state=1,n_nearest_features=10,imputation_order='random')
+        imp_mean.fit(X_train)
+        X_train = imp_mean.transform(X_train)
+        X_test = imp_mean.transform(X_test)
+    return X_train, X_test, y_train, y_test,test_idx
+
 def select_model_and_features(dataset,method,X0,y00,strat_var0,feature_key,logger,export_feature_names = False):
 
     print('####################### dataset:', dataset)
     logger.warning(f'computing: {dataset}')
     if dataset == 'allfeatures':
-        X00 = X0.astype(float)
+        feature_names = feature_key.loc[feature_key['type'].isin(['raw']),'feature'].to_list()
     elif dataset == 'classes+decay':
-        X00 = X0.loc[:,feature_key.loc[feature_key['type'].isin(['class','decay','demo']),'feature']].astype(float)
+        feature_names = feature_key.loc[feature_key['type'].isin(['class','decay','longitudinal']),'feature'].to_list()
     elif dataset == 'classes':
-        X00 = X0.loc[:,feature_key.loc[feature_key['type'].isin(['class','demo']),'feature']].astype(float)
+        feature_names = feature_key.loc[feature_key['type'].isin(['class','longitudinal']),'feature'].to_list()
+    elif dataset == 'classes_eq':
+        feature_names = feature_key.loc[feature_key['type'].isin(['class_eq','longitudinal']),'feature'].to_list()
+    elif dataset == 'classes_neq':
+        feature_names = feature_key.loc[feature_key['type'].isin(['class_neq','longitudinal']),'feature'].to_list()
+    elif dataset == 'classes_slope':
+        feature_names = feature_key.loc[feature_key['type'].isin(['class_slope','longitudinal']),'feature'].to_list()
+    elif dataset == 'classes_neqm':
+        feature_names = feature_key.loc[feature_key['type'].isin(['class_neqm','longitudinal']),'feature'].to_list()
+    elif dataset == 'demo+classes_neqm':
+        feature_names = feature_key.loc[feature_key['type'].isin(['demo','class_neqm','longitudinal']),'feature'].to_list()
+    elif dataset == 'demo':
+        feature_names = feature_key.loc[feature_key['type'].isin(['demo']),'feature'].to_list()
     elif dataset == 'decayfeatures':
-        X00 = X0.loc[:,feature_key.loc[feature_key['type'].isin(['decay','demo']),'feature']].astype(float)
+        feature_names = feature_key.loc[feature_key['type'].isin(['decay','demo']),'feature'].to_list()
     elif dataset == 'rawfeatures':
-        X00 = X0.loc[:,feature_key.loc[feature_key['type'].isin(['raw','demo']),'feature']].astype(float)
+        feature_names = feature_key.loc[feature_key['type'].isin(['raw','demo']),'feature'].to_list()
+    elif dataset == 'indiv':
+        feature_names = feature_key.loc[feature_key['type'].isin(['class_neqm','longitudinal','demo']),'feature'].to_list()
     elif dataset == 'encals':
+        # currently this block of code will not work
         X00 = X0.copy()
         X00.loc[:,'C9orf72'] = X00.loc[:,'C9orf72'].fillna(0)
         g = X00.isna().sum()
-        encals_cols = feature_key.loc[feature_key['type'].isin(['encals']),'feature'].to_list()
-        cols_for_imputing = [k for k in g[(g==0).values].index if k not in encals_cols]+encals_cols
+        feature_names = feature_key.loc[feature_key['type'].isin(['encals']),'feature'].to_list()
+        cols_for_imputing = [k for k in g[(g==0).values].index if k not in feature_names]+feature_names
         imputer_df = X00.loc[:,cols_for_imputing]
 
         # MICE imputation - Multiple Imputation by Chain Equations
@@ -843,11 +923,22 @@ def select_model_and_features(dataset,method,X0,y00,strat_var0,feature_key,logge
         aux = imp_mean.fit_transform(imputer_df)
 
         X00 = aux[:,-7:]
-        
+    
     else:
         raise Exception(f'Unknown dataset {dataset}')
     
-    feature_names = list(X00.keys()) if dataset!='encals' else encals_cols
+    # assign features
+    X00 = X0.loc[:,feature_names].astype(float)
+
+    # if mice_imputation:
+
+    #     # MICE imputation - Multiple Imputation by Chain Equations
+    #     imp_mean = IterativeImputer(random_state=1,n_nearest_features=10,imputation_order='random')
+    #     aux = imp_mean.fit_transform(X00)
+
+    #     X00 = pd.DataFrame(aux,columns=X00.columns)
+
+    # feature_names = list(X00.keys()) if dataset!='encals' else encals_cols
     
     X00 = X00.values if dataset!='encals' else X00
     y = y00.copy()
@@ -868,27 +959,27 @@ def select_model_and_features(dataset,method,X0,y00,strat_var0,feature_key,logge
         # scale features
         X00 = model_obj.scaler().fit_transform(X00)
         X = X00.copy()        
-        X,y,strat_var = remove_nans(X00,y00,strat_var0,col_threshold = 4000)
+        X,y,strat_var,cols_to_keep = remove_nans(X00,y00,strat_var0,col_threshold = 4000)
+        feature_names = list(np.array(feature_names)[cols_to_keep])
     else:
         raise Exception(f'Unknown method {method}')
-
-    
+   
     if export_feature_names:
         return model_obj,X,y,strat_var,feature_names
     
-    return model_obj,X,y,strat_var
+    return model_obj,X,y,strat_var,feature_names
 
 def hyperopt_all_methods(dataset,method,X0, y00, tau, strat_var0, feature_key,logger, seed=1,n_trials=2):
-    X0.drop(columns=['Database_ArQ', 'Database_IDPP', 'Database_PROACT'])
+    
     # try:
     if True:
         # select model
-        model_obj,X,y,strat_var = select_model_and_features(dataset,method,X0,y00,strat_var0,feature_key,logger)
+        model_obj,X,y,strat_var,_ = select_model_and_features(dataset,method,X0,y00,strat_var0,feature_key,logger)
 
         out = run_nested_cv(X=X, y=y, tau=tau, strat_var=strat_var,seed=seed,
                     sampler=RandomSampler(seed=seed),
                     n_trials=n_trials,
-                    model_obj=model_obj)
+                    model_obj=model_obj,dataset=dataset)
 
         out['dataset'] = dataset
         out['method'] = method
@@ -905,38 +996,84 @@ def hyperopt_all_methods(dataset,method,X0, y00, tau, strat_var0, feature_key,lo
     #     print(e)
     #     return pd.DataFrame([])
 
-def train_all_methods(row,X0,y00,tau,strat_var0,feature_key,logger):
-    # invoke model object & filter data if needed
-    # model_obj = XGBoostAFT(distribution=row.method.replace('XGBoostAFT','').lower())
-    # test_idx = X0.loc[:,'Database_IDPP'].values
-    X0.drop(columns=['Database_ArQ', 'Database_IDPP', 'Database_PROACT'])
+def run_indiv_pred(xi,x,row,model_obj,y,strat_var,feature_names):
+    print('Computing individual predictions:',feature_names[xi],f"{xi+1}/{len(feature_names)}")
+    x = x.reshape(-1,1)
+    dfaux,dfsummary,dfpred = train_all_methods(row,model_obj,x,y,strat_var)
+    dfaux['feature'] = feature_names[xi]
+    dfsummary['feature'] = feature_names[xi]
+    dfpred['feature'] = feature_names[xi]
+    return dfaux,dfsummary,dfpred
+
+def train_all_methods_wrapper(row,X0,y00,tau,strat_var0,feature_key,logger):
+    
+    model_obj,X,y,strat_var,feature_names = select_model_and_features(row.dataset,row.method,X0,y00,strat_var0,feature_key,logger)
+    
+    if row.dataset!='indiv':    
+        dfaux,dfsummary,dfpred = train_all_methods(row,model_obj,X,y,strat_var)
+    else:
+        from multiprocessing import Pool
+        
+        with Pool(14) as p:
+            input_data = ((xi,x,row,model_obj,y,strat_var,feature_names) for xi,x in enumerate(X.T))
+            res = p.starmap(run_indiv_pred, input_data)
+
+        # decode the results
+        dfaux,dfsummary,dfpred = [],[],[]
+        for r in res:
+            dfsummary.append(r[1])
+            dfaux.append(r[0])
+            dfpred.append(r[2])
+        dfaux = pd.concat(dfaux,axis=0,ignore_index=True)
+        dfsummary = pd.concat(dfsummary,axis=0,ignore_index=True)
+        dfpred = pd.concat(dfpred,axis=0,ignore_index=True)
+    # dfaux.to_csv('daux.csv'),dfsummary.to_csv('dfsummary.csv'),dfpred.to_csv('dfpred.csv')
+    return dfaux,dfsummary,dfpred
+
+def train_all_methods(row,model_obj,X,y,strat_var):
 
     Daux,Dsummary,Dpred = [],[],[]
     
     database_rotation = row['test_fold']
-    # for database_rotation in ['ArQ', 'IDPP', 'PROACT']:
     print(f'########## rotation: {database_rotation}')
-    start = time.time()
-    
-    model_obj,X,y,strat_var = select_model_and_features(row.dataset,row.method,X0,y00,strat_var0,feature_key,logger)
-
-    test_idx = (strat_var == database_rotation).reshape(-1,)
+    start = time.time() 
 
     # perform split
-    # X_train, X_test, y_train, y_test = train_test_split(X, y,
-    #                                                 stratify=strat_var, 
-    #                                                 test_size=0.3,random_state=seed)
-    X_train, X_test, y_train, y_test = X[~test_idx,:],X[test_idx,:],y[~test_idx],y[test_idx]
-    
+    X_train, X_test, y_train, y_test, test_idx = split_data_add_mice(X,y,strat_var,database_rotation)
+
     # set parameters
     model_obj.set_params(row)
-    
-    # build matrices
-    dtest = model_obj.dmat_builder(X_test, y_test)
-    dtrain_valid_combined = model_obj.dmat_builder(X_train, y_train)
 
-    # compute predictions
-    y_pred,y_pred_train = model_obj.compute_test_pred(None, dtrain_valid_combined, dtest,params_df=model_obj.params_df)
+    additive_name = '_mice' if mice_imputation else ''
+    
+    if test_only:
+        # reload model
+        with open(f'models/gastro_{row.method}_{row.dataset}_{database_rotation}{additive_name}.pkl', 'rb') as fid:
+            model_obj = pickle.load(fid)
+        
+        # build matrices
+        dtest = model_obj.dmat_builder(X_test, y_test)
+        dtrain_valid_combined = model_obj.dmat_builder(X_train, y_train)
+        if row.method == 'SkSurvCoxLinear':
+            dtest = dtest[0]
+            dtrain_valid_combined = dtrain_valid_combined[0]
+
+        # get predictions
+        y_pred = model_obj.modelnow.predict(dtest)
+        y_pred_train = model_obj.modelnow.predict(dtrain_valid_combined)
+    
+    else:
+        
+        # build matrices
+        dtest = model_obj.dmat_builder(X_test, y_test)
+        dtrain_valid_combined = model_obj.dmat_builder(X_train, y_train)
+
+        # compute predictions
+        y_pred,y_pred_train = model_obj.compute_test_pred(None, dtrain_valid_combined, dtest,params_df=model_obj.params_df)
+
+        # save model            
+        with open(f'models/gastro_{row.method}_{row.dataset}_{database_rotation}{additive_name}.pkl', 'wb') as fid:
+            pickle.dump(model_obj, fid)
 
     # kernel = row.kernel if isinstance(row.kernel,str) else ''
     # pickle.dump(model_obj, open('data/'+row.method+row.dataset+kernel+'.sav', 'wb'))
@@ -962,44 +1099,9 @@ def train_all_methods(row,X0,y00,tau,strat_var0,feature_key,logger):
     print(f'Time elapsed = {time_taken}')
     dfsummary['elapsed_time'] = time_taken
 
-    # save model
-    with open(f'models/gastro_{row.method}_{row.dataset}_{database_rotation}.pkl', 'wb') as fid:
-        pickle.dump(model_obj, fid)
-
     # bootstrapping
     if bootstrap_flag:
-        start = time.time()
-        n_iterations = 100
-        bootstrap_frac = .5
-        n_size = int(len(X_test) * bootstrap_frac)
-        A = []
-        suffix = '_test'
-        for i in range(n_iterations):
-            x = np.arange(X_test.shape[0])
-            np.random.shuffle(x)
-            test_uncensored = np.ones(n_size).astype(bool)
-            dtest = model_obj.dmat_builder(X_test[x[:n_size],:], y_test[x[:n_size]])
-            
-            # y_pred_now,y_pred_train_now = model_obj.compute_test_pred(None, dtrain_valid_combined, dtest,params_df=model_obj.params_df)
-
-            aux = calc_all_metrics(pd.DataFrame(),None,model_obj,None,dtrain_valid_combined, dtest,[train_uncensored,test_uncensored])
-            # aux = calc_all_metrics(pd.DataFrame(),None,model_obj,None,X_test,y_test,y_pred_train_now,x[:n_size],x[:n_size])
-
-            A.append(aux.loc[:,['PredIn90'+suffix,'MedianAE'+suffix,'Cindex'+suffix]])
-        
-        A = pd.concat(A)
-        
-        for var,max in {'Cindex':1,'MedianAE':10000,'PredIn90':1}.items():
-            dfsummary[f'{var}_mean'] = A.loc[:,var+suffix].mean()
-            dfsummary[f'{var}_lb'] = np.clip(dfsummary[f'{var}_mean']-A.loc[:,var+suffix].std()*1.96,a_min=0,a_max=None)
-            dfsummary[f'{var}_ub'] = np.clip(dfsummary[f'{var}_mean']+A.loc[:,var+suffix].std()*1.96,a_min=None,a_max=max)
-        end = time.time()
-        time_taken = end - start
-        print(f'Time elapsed (boostrapping n={n_iterations}) = {time_taken}')
-        dfsummary['elapsed_time_bootstrap'] = time_taken
-        dfsummary['n_bootstraps'] = n_iterations
-        dfsummary['bootstrap_frac'] = bootstrap_frac
-
+        dfsummary = calc_bootstrap(model_obj,dfsummary,X_test,y_test,dtrain_valid_combined,train_uncensored,test_uncensored)
         # try: 
         if True:
 
@@ -1047,8 +1149,14 @@ def train_all_methods(row,X0,y00,tau,strat_var0,feature_key,logger):
         Daux.append(dfaux.copy())
         Dsummary.append(dfsummary.copy())
         Dpred.append(dfpred.copy())
+        # dfsummary.to_csv(f'summary_{database_rotation}_{row.method}_{row.dataset}.csv',index=False)
+        # dfpred.to_csv(f'dfpred_{database_rotation}_{row.method}_{row.dataset}.csv',index=False)
+        # dfaux.to_csv(f'dfaux_{database_rotation}_{row.method}_{row.dataset}.csv',index=False)
     dfaux = pd.concat(Daux,axis=0,ignore_index=True)
     dfsummary = pd.concat(Dsummary,axis=0,ignore_index=True)
     dfpred = pd.concat(Dpred,axis=0,ignore_index=True)
     return dfaux,dfsummary,dfpred
     # print(f'Done! row:{ri+1}/{models_df.shape[0]}')
+
+
+
